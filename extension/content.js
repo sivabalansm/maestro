@@ -22,6 +22,8 @@
         return await executeFill(params);
       case 'extract':
         return await executeExtract(params);
+      case 'extractPageHtml':
+        return await executeExtractPageHtml(params);
       case 'custom':
         return await executeCustom(params);
       default:
@@ -132,6 +134,201 @@
       count: results.length,
       results: results.length === 1 ? results[0] : results
     };
+  }
+
+  async function executeExtractPageHtml(params) {
+    // Extract structured page information instead of full HTML
+    const interactiveElements = [];
+    
+    // Get all interactive elements
+    const selectors = [
+      'button',
+      'input',
+      'textarea',
+      'select',
+      'a[href]',
+      '[onclick]',
+      '[role="button"]',
+      '[role="link"]',
+      '[role="menuitem"]',
+      '[tabindex]:not([tabindex="-1"])'
+    ];
+    
+    const allElements = document.querySelectorAll(selectors.join(', '));
+    
+    allElements.forEach((el, index) => {
+      // Skip hidden elements
+      if (el.offsetParent === null && el.style.display === 'none') {
+        return;
+      }
+      
+      const element = {
+        index: index,
+        tagName: el.tagName.toLowerCase(),
+        type: getElementType(el),
+        selector: generateSelector(el),
+        label: getElementLabel(el),
+        value: getElementValue(el),
+        attributes: getRelevantAttributes(el),
+        visible: isElementVisible(el)
+      };
+      
+      interactiveElements.push(element);
+    });
+    
+    // Get page metadata
+    const pageInfo = {
+      url: window.location.href,
+      title: document.title,
+      description: getMetaDescription(),
+      headings: getHeadings(),
+      interactiveElements: interactiveElements.filter(el => el.visible).slice(0, 200) // Limit to 200 elements
+    };
+    
+    return pageInfo;
+  }
+  
+  function getElementType(el) {
+    if (el.tagName === 'INPUT') {
+      return el.type || 'text';
+    }
+    if (el.tagName === 'BUTTON') return 'button';
+    if (el.tagName === 'A') return 'link';
+    if (el.tagName === 'SELECT') return 'select';
+    if (el.tagName === 'TEXTAREA') return 'textarea';
+    if (el.hasAttribute('role')) return el.getAttribute('role');
+    if (el.hasAttribute('onclick')) return 'clickable';
+    return 'interactive';
+  }
+  
+  function generateSelector(el) {
+    // Try ID first
+    if (el.id) {
+      return `#${el.id}`;
+    }
+    
+    // Try data attributes
+    if (el.hasAttribute('data-testid')) {
+      return `[data-testid="${el.getAttribute('data-testid')}"]`;
+    }
+    if (el.hasAttribute('data-id')) {
+      return `[data-id="${el.getAttribute('data-id')}"]`;
+    }
+    
+    // Try name attribute for forms
+    if (el.name) {
+      return `${el.tagName.toLowerCase()}[name="${el.name}"]`;
+    }
+    
+    // Try class with tag
+    if (el.className && typeof el.className === 'string') {
+      const classes = el.className.split(' ').filter(c => c && !c.includes(' '));
+      if (classes.length > 0) {
+        return `${el.tagName.toLowerCase()}.${classes[0]}`;
+      }
+    }
+    
+    // Fallback to tag + nth-of-type
+    const parent = el.parentElement;
+    if (parent) {
+      const siblings = Array.from(parent.children).filter(c => c.tagName === el.tagName);
+      const index = siblings.indexOf(el);
+      return `${el.tagName.toLowerCase()}:nth-of-type(${index + 1})`;
+    }
+    
+    return el.tagName.toLowerCase();
+  }
+  
+  function getElementLabel(el) {
+    // Try aria-label
+    if (el.getAttribute('aria-label')) {
+      return el.getAttribute('aria-label').trim();
+    }
+    
+    // Try text content for buttons/links
+    if (el.tagName === 'BUTTON' || el.tagName === 'A') {
+      const text = el.textContent?.trim();
+      if (text && text.length < 100) {
+        return text;
+      }
+    }
+    
+    // Try associated label
+    if (el.id) {
+      const label = document.querySelector(`label[for="${el.id}"]`);
+      if (label) {
+        return label.textContent?.trim();
+      }
+    }
+    
+    // Try placeholder
+    if (el.placeholder) {
+      return el.placeholder;
+    }
+    
+    // Try title
+    if (el.title) {
+      return el.title;
+    }
+    
+    // Try alt for images
+    if (el.alt) {
+      return el.alt;
+    }
+    
+    return '';
+  }
+  
+  function getElementValue(el) {
+    if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
+      return el.value || '';
+    }
+    if (el.tagName === 'SELECT') {
+      return el.options[el.selectedIndex]?.text || '';
+    }
+    return '';
+  }
+  
+  function getRelevantAttributes(el) {
+    const attrs = {};
+    const relevant = ['id', 'name', 'type', 'placeholder', 'href', 'src', 'aria-label', 'role', 'data-testid'];
+    
+    relevant.forEach(attr => {
+      if (el.hasAttribute(attr)) {
+        attrs[attr] = el.getAttribute(attr);
+      }
+    });
+    
+    return attrs;
+  }
+  
+  function isElementVisible(el) {
+    const style = window.getComputedStyle(el);
+    return style.display !== 'none' && 
+           style.visibility !== 'hidden' && 
+           style.opacity !== '0' &&
+           el.offsetWidth > 0 && 
+           el.offsetHeight > 0;
+  }
+  
+  function getMetaDescription() {
+    const meta = document.querySelector('meta[name="description"]');
+    return meta ? meta.getAttribute('content') : '';
+  }
+  
+  function getHeadings() {
+    const headings = [];
+    const hElements = document.querySelectorAll('h1, h2, h3, h4, h5, h6');
+    hElements.forEach(h => {
+      const text = h.textContent?.trim();
+      if (text && text.length < 200) {
+        headings.push({
+          level: parseInt(h.tagName.substring(1)),
+          text: text
+        });
+      }
+    });
+    return headings.slice(0, 10); // Limit to 10 headings
   }
 
   async function executeCustom(params) {

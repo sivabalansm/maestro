@@ -27,65 +27,81 @@ export default function Home() {
 
     const userMessage = { role: 'user', content: input };
     setMessages((prev) => [...prev, userMessage]);
+    const prompt = input;
     setInput('');
     setIsLoading(true);
 
     try {
-      // Convert prompt to task
-      // In production, this would use an AI model to convert natural language to tasks
-      const task = convertPromptToTask(input);
+      // Get primary connected extension
+      let extensionId;
+      try {
+        const primaryRes = await axios.get(`${API_URL}/api/extension/primary`);
+        extensionId = primaryRes.data.extensionId;
+      } catch (error) {
+        if (error.response?.status === 404) {
+          setMessages((prev) => [
+            ...prev,
+            { role: 'assistant', content: 'Error: No browser extension connected. Please make sure the Maestro extension is loaded and connected to the backend.' }
+          ]);
+          setIsLoading(false);
+          return;
+        }
+        throw error;
+      }
 
-      // Create task
-      const response = await axios.post(`${API_URL}/api/tasks/create`, {
-        type: task.type,
-        params: task.params,
-        scheduledAt: scheduledTime || null,
-        extensionId: 'ext_demo', // In production, get from extension registration
-        userId: 'anonymous'
+      // Start AI-powered task sequence
+      const response = await axios.post(`${API_URL}/api/ai/start`, {
+        prompt,
+        extensionId,
+        userId: 'anonymous',
+        scheduledAt: scheduledTime || null
       });
+
+      const { task, reasoning, sessionId, isComplete } = response.data;
 
       const assistantMessage = {
         role: 'assistant',
-        content: `Task created: ${task.type}. ${scheduledTime ? `Scheduled for ${new Date(scheduledTime).toLocaleString()}` : 'Executing now...'}`,
-        task: response.data.task
+        content: `AI Analysis: ${reasoning}\n\nTask: ${task.type}${isComplete ? ' (Complete)' : ' (Continuing...)'}`,
+        task,
+        reasoning,
+        sessionId,
+        isComplete
       };
 
       setMessages((prev) => [...prev, assistantMessage]);
       setScheduledTime('');
+
+      // If task is not complete, start polling for updates
+      if (!isComplete && sessionId) {
+        // Poll for task updates (in a real implementation, use WebSocket)
+        pollTaskUpdates(sessionId);
+      }
     } catch (error) {
-      console.error('Error creating task:', error);
+      console.error('Error starting AI task:', error);
       setMessages((prev) => [
         ...prev,
-        { role: 'assistant', content: `Error: ${error.message}` }
+        { role: 'assistant', content: `Error: ${error.response?.data?.error || error.message}` }
       ]);
     } finally {
       setIsLoading(false);
     }
   };
 
-  const convertPromptToTask = (prompt) => {
-    const lower = prompt.toLowerCase();
+  const pollTaskUpdates = async (sessionId) => {
+    // Simple polling - in production, use WebSocket for real-time updates
+    const pollInterval = setInterval(async () => {
+      try {
+        // Check if session is still active
+        // This is a simplified version - in production, you'd get updates via WebSocket
+        // or check task status from the dashboard
+      } catch (error) {
+        console.error('Error polling task updates:', error);
+        clearInterval(pollInterval);
+      }
+    }, 5000);
 
-    // Simple rule-based conversion (in production, use AI)
-    if (lower.includes('open') || lower.includes('navigate') || lower.includes('go to')) {
-      const urlMatch = prompt.match(/(https?:\/\/[^\s]+|www\.[^\s]+|[a-z]+\.[a-z]+)/i);
-      const url = urlMatch ? (urlMatch[0].startsWith('http') ? urlMatch[0] : `https://${urlMatch[0]}`) : 'https://google.com';
-      return { type: 'navigate', params: { url } };
-    }
-
-    if (lower.includes('click')) {
-      const selectorMatch = prompt.match(/click\s+(?:on\s+)?(?:the\s+)?([^\s]+)/i);
-      return { type: 'click', params: { selector: selectorMatch ? `#${selectorMatch[1]}` : 'button' } };
-    }
-
-    if (lower.includes('fill') || lower.includes('type') || lower.includes('search')) {
-      const valueMatch = prompt.match(/(?:fill|type|search)\s+(?:for\s+)?["']?([^"']+)["']?/i);
-      const value = valueMatch ? valueMatch[1] : prompt.split(' ').slice(1).join(' ');
-      return { type: 'fill', params: { selector: 'input[type="search"], input[type="text"]', value } };
-    }
-
-    // Default: navigate to Google
-    return { type: 'navigate', params: { url: 'https://google.com' } };
+    // Stop polling after 5 minutes
+    setTimeout(() => clearInterval(pollInterval), 300000);
   };
 
   return (
@@ -94,7 +110,7 @@ export default function Home() {
         <CardHeader>
           <CardTitle>Maestro Agent</CardTitle>
           <CardDescription>
-            Describe what you want to automate, and I'll create a task for the browser extension.
+            Describe what you want to automate. AI will analyze the current page and generate tasks automatically.
           </CardDescription>
         </CardHeader>
         <CardContent className="flex-1 flex flex-col overflow-hidden">
@@ -103,7 +119,7 @@ export default function Home() {
             {messages.length === 0 && (
               <div className="text-center text-muted-foreground py-8">
                 <p>Start by describing a task you want to automate.</p>
-                <p className="text-sm mt-2">Example: "Open google.com and search for AI"</p>
+                <p className="text-sm mt-2">Example: "Click the search button" or "Fill the form with my email"</p>
               </div>
             )}
             {messages.map((msg, idx) => (

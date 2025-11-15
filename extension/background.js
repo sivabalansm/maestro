@@ -7,6 +7,10 @@ let ws = null;
 let reconnectAttempts = 0;
 const MAX_RECONNECT_ATTEMPTS = 10;
 let extensionId = null;
+let pingInterval = null;
+let lastPongTime = null;
+const PING_INTERVAL = 30000; // 30 seconds
+const PONG_TIMEOUT = 60000; // 60 seconds - if no pong received, reconnect
 
 // Initialize WebSocket connection
 async function initWebSocket() {
@@ -25,12 +29,17 @@ async function initWebSocket() {
     ws.onopen = () => {
       console.log('[Maestro] WebSocket connected');
       reconnectAttempts = 0;
+      lastPongTime = Date.now();
+      
       // Register extension with backend
       sendToBackend({
         type: 'register',
         extensionId,
         timestamp: Date.now()
       });
+
+      // Start periodic ping to keep connection alive
+      startPingInterval();
     };
 
     ws.onmessage = async (event) => {
@@ -48,6 +57,7 @@ async function initWebSocket() {
 
     ws.onclose = () => {
       console.log('[Maestro] WebSocket closed, attempting reconnect...');
+      stopPingInterval();
       attemptReconnect();
     };
   } catch (error) {
@@ -79,8 +89,40 @@ function sendToBackend(data) {
   }
 }
 
+// Start periodic ping to keep connection alive
+function startPingInterval() {
+  stopPingInterval(); // Clear any existing interval
+  
+  pingInterval = setInterval(() => {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      // Check if we haven't received a pong in too long
+      if (lastPongTime && (Date.now() - lastPongTime) > PONG_TIMEOUT) {
+        console.warn('[Maestro] No pong received, reconnecting...');
+        ws.close();
+        return;
+      }
+      
+      // Send ping
+      sendToBackend({
+        type: 'ping',
+        timestamp: Date.now()
+      });
+    } else {
+      stopPingInterval();
+    }
+  }, PING_INTERVAL);
+}
+
+// Stop ping interval
+function stopPingInterval() {
+  if (pingInterval) {
+    clearInterval(pingInterval);
+    pingInterval = null;
+  }
+}
+
 async function handleBackendMessage(message) {
-  const { type, task } = message;
+  const { type, task, requestId } = message;
 
   switch (type) {
     case 'task':
@@ -88,8 +130,23 @@ async function handleBackendMessage(message) {
         await executeTask(task);
       }
       break;
+    case 'request_page_html':
+      // Extract structured page information and send back
+      const pageInfo = await extractPageHtml();
+      sendToBackend({
+        type: 'page_html',
+        requestId,
+        pageInfo: pageInfo
+      });
+      break;
     case 'ping':
+      // Update last pong time and respond
+      lastPongTime = Date.now();
       sendToBackend({ type: 'pong', timestamp: Date.now() });
+      break;
+    case 'connected':
+      // Update last pong time on connection confirmation
+      lastPongTime = Date.now();
       break;
     default:
       console.log('[Maestro] Unknown message type:', type);
@@ -135,21 +192,61 @@ async function executeTask(task) {
         throw new Error(`Unknown task type: ${taskType}`);
     }
 
-    // Send task completed status
+    // Wait a bit for page to update after task (especially for clicks that trigger navigation)
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    
+    // Extract structured page information after task completion
+    let pageInfo = null;
+    try {
+      // Retry logic for page info extraction
+      let retries = 3;
+      while (retries > 0) {
+        try {
+          pageInfo = await extractPageHtml();
+          break;
+        } catch (htmlError) {
+          retries--;
+          if (retries > 0) {
+            console.log(`[Maestro] Retrying page info extraction (${retries} retries left)...`);
+            await new Promise(resolve => setTimeout(resolve, 500));
+          } else {
+            console.warn(`[Maestro] Failed to extract page info after retries:`, htmlError);
+          }
+        }
+      }
+    } catch (htmlError) {
+      console.warn(`[Maestro] Failed to extract page info:`, htmlError);
+    }
+
+    // Send task completed status with structured page info
     sendToBackend({
       type: 'task_result',
       taskId: id,
       status: 'completed',
       result,
+      pageInfo,
       timestamp: Date.now()
     });
   } catch (error) {
     console.error(`[Maestro] Task ${id} failed:`, error);
+    
+    // Try to extract page info even on error
+    let pageInfo = null;
+    try {
+      // Wait a bit before extracting
+      await new Promise(resolve => setTimeout(resolve, 500));
+      
+      pageInfo = await extractPageHtml();
+    } catch (htmlError) {
+      console.warn(`[Maestro] Failed to extract page info:`, htmlError);
+    }
+
     sendToBackend({
       type: 'task_result',
       taskId: id,
       status: 'failed',
       error: error.message,
+      pageInfo,
       timestamp: Date.now()
     });
   }
@@ -158,6 +255,25 @@ async function executeTask(task) {
 async function handleNavigate(params) {
   const { url } = params;
   const tab = await chrome.tabs.create({ url, active: true });
+  
+  // Wait for page to load completely
+  await new Promise((resolve) => {
+    const checkComplete = (tabId, changeInfo) => {
+      if (tabId === tab.id && changeInfo.status === 'complete') {
+        chrome.tabs.onUpdated.removeListener(checkComplete);
+        // Additional wait for dynamic content
+        setTimeout(resolve, 1000);
+      }
+    };
+    chrome.tabs.onUpdated.addListener(checkComplete);
+    
+    // Timeout after 10 seconds
+    setTimeout(() => {
+      chrome.tabs.onUpdated.removeListener(checkComplete);
+      resolve();
+    }, 10000);
+  });
+  
   return { tabId: tab.id, url };
 }
 
@@ -268,6 +384,59 @@ async function handleCustom(params) {
   });
 }
 
+// Extract page HTML from active tab
+async function extractPageHtml(tabId = null) {
+  const targetTabId = tabId || (await chrome.tabs.query({ active: true, currentWindow: true }))[0]?.id;
+
+  if (!targetTabId) {
+    throw new Error('No active tab found');
+  }
+
+  // Ensure content script is loaded - try to inject if needed
+  try {
+    // Check if we can access the page
+    await chrome.tabs.sendMessage(targetTabId, { type: 'ping' }, () => {
+      // If this fails, content script might not be loaded
+    });
+  } catch (error) {
+    // Content script might not be loaded, try to inject it
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId: targetTabId },
+        files: ['content.js']
+      });
+      // Wait for script to initialize
+      await new Promise(resolve => setTimeout(resolve, 500));
+    } catch (injectError) {
+      console.warn('[Maestro] Could not inject content script:', injectError);
+      // Continue anyway - might work if content script loads naturally
+    }
+  }
+
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      reject(new Error('Timeout waiting for page HTML extraction'));
+    }, 10000); // 10 second timeout
+
+    chrome.tabs.sendMessage(targetTabId, {
+      type: 'execute',
+      action: 'extractPageHtml',
+      params: {}
+    }, (response) => {
+      clearTimeout(timeout);
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message));
+      } else if (response?.error) {
+        reject(new Error(response.error));
+      } else if (response?.success && response.result) {
+        resolve(response.result);
+      } else {
+        reject(new Error('Failed to extract page HTML'));
+      }
+    });
+  });
+}
+
 // Listen for messages from content script
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === 'task_result') {
@@ -284,17 +453,43 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   return true; // Keep channel open for async response
 });
 
+// Keep service worker alive during active operations
+let keepAliveInterval = null;
+
+function keepServiceWorkerAlive() {
+  // Chrome service workers can be put to sleep after 30 seconds of inactivity
+  // We'll keep it alive by periodically checking storage
+  keepAliveInterval = setInterval(async () => {
+    try {
+      // Simple operation to keep service worker active
+      await chrome.storage.local.get(['extensionId']);
+    } catch (error) {
+      // Ignore errors
+    }
+  }, 20000); // Every 20 seconds
+}
+
+function stopKeepAlive() {
+  if (keepAliveInterval) {
+    clearInterval(keepAliveInterval);
+    keepAliveInterval = null;
+  }
+}
+
 // Initialize on extension install/start
 chrome.runtime.onInstalled.addListener(() => {
   console.log('[Maestro] Extension installed');
+  keepServiceWorkerAlive();
   initWebSocket();
 });
 
 chrome.runtime.onStartup.addListener(() => {
   console.log('[Maestro] Extension started');
+  keepServiceWorkerAlive();
   initWebSocket();
 });
 
 // Initialize WebSocket on service worker startup
+keepServiceWorkerAlive();
 initWebSocket();
 

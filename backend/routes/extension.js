@@ -45,5 +45,14 @@ router.get('/connections', (req, res) => {
   res.json({ connections, count: connections.length });
 });
 
+// Get primary connected extension
+router.get('/primary', (req, res) => {
+  const connections = Array.from(extensionConnections.keys());
+  if (connections.length === 0) {
+    return res.status(404).json({ error: 'No extensions connected' });
+  }
+  res.json({ extensionId: connections[0], total: connections.length });
+});
+
 export default router;
 

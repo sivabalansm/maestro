@@ -9,6 +9,7 @@ import { initDatabase } from './db.js';
 import taskRoutes from './routes/tasks.js';
 import extensionRoutes from './routes/extension.js';
 import authRoutes from './routes/auth.js';
+import aiRoutes, { handlePageHtmlResponse } from './routes/ai.js';
 
 dotenv.config();
 
@@ -29,6 +30,9 @@ app.use(express.json());
 // Store active WebSocket connections by extensionId
 const extensionConnections = new Map();
 
+// Store active AI sessions: Map<sessionId, { extensionId, taskId }>
+const activeAISessions = new Map();
+
 // WebSocket connection handler
 wss.on('connection', (ws, req) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
@@ -42,6 +46,26 @@ wss.on('connection', (ws, req) => {
   console.log(`[WS] Extension connected: ${extensionId}`);
   extensionConnections.set(extensionId, ws);
 
+  // Set up ping interval for this connection
+  const pingInterval = setInterval(() => {
+    if (ws.readyState === 1) { // WebSocket.OPEN
+      try {
+        ws.send(JSON.stringify({
+          type: 'ping',
+          timestamp: Date.now()
+        }));
+      } catch (error) {
+        console.error(`[WS] Error sending ping to ${extensionId}:`, error);
+        clearInterval(pingInterval);
+      }
+    } else {
+      clearInterval(pingInterval);
+    }
+  }, 30000); // Ping every 30 seconds
+
+  // Store ping interval with connection for cleanup
+  ws._pingInterval = pingInterval;
+
   ws.on('message', async (data) => {
     try {
       const message = JSON.parse(data.toString());
@@ -53,11 +77,17 @@ wss.on('connection', (ws, req) => {
 
   ws.on('close', () => {
     console.log(`[WS] Extension disconnected: ${extensionId}`);
+    if (ws._pingInterval) {
+      clearInterval(ws._pingInterval);
+    }
     extensionConnections.delete(extensionId);
   });
 
   ws.on('error', (error) => {
     console.error(`[WS] Error for ${extensionId}:`, error);
+    if (ws._pingInterval) {
+      clearInterval(ws._pingInterval);
+    }
   });
 
   // Send welcome message
@@ -69,7 +99,7 @@ wss.on('connection', (ws, req) => {
 });
 
 async function handleExtensionMessage(extensionId, message) {
-  const { type, taskId, status, result, error } = message;
+  const { type, taskId, status, result, error, requestId, html, pageHtml, pageInfo } = message;
 
   switch (type) {
     case 'register':
@@ -85,12 +115,32 @@ async function handleExtensionMessage(extensionId, message) {
 
     case 'task_result':
       console.log(`[WS] Task ${taskId} result: ${status}`);
-      // Store task result in database
-      // Emit to frontend
+      
+      // Check if this task is part of an AI session
+      const sessionEntry = Array.from(activeAISessions.entries()).find(
+        ([_, session]) => session.taskId === taskId
+      );
+
+      // Use pageInfo if available, fallback to pageHtml for backward compatibility
+      const pageData = pageInfo || (pageHtml ? { html: pageHtml } : null);
+      
+      if (sessionEntry && pageData) {
+        const [sessionId, sessionData] = sessionEntry;
+        // Continue AI task sequence
+        await continueAITaskSequence(sessionId, taskId, result, pageData, error);
+      }
+      break;
+
+    case 'page_html':
+      // Handle page info response from extension
+      if (requestId && (pageInfo || html)) {
+        handlePageHtmlResponse(requestId, pageInfo || html);
+      }
       break;
 
     case 'pong':
-      // Heartbeat response
+      // Heartbeat response - connection is alive
+      // Optionally log for debugging: console.log(`[WS] Pong received from ${extensionId}`);
       break;
 
     default:
@@ -98,23 +148,89 @@ async function handleExtensionMessage(extensionId, message) {
   }
 }
 
+// Helper function to continue AI task sequence
+async function continueAITaskSequence(sessionId, completedTaskId, taskResult, pageData, taskError) {
+  try {
+    const { getAISession, getTask, updateTaskStatus } = await import('./db.js');
+    const session = await getAISession(sessionId);
+    if (!session || session.status !== 'active') {
+      console.log(`[AI] Session ${sessionId} is not active, skipping continuation`);
+      return;
+    }
+
+    const completedTask = await getTask(completedTaskId);
+    
+    // Update task status in database
+    if (completedTask) {
+      await updateTaskStatus(completedTaskId, taskError ? 'failed' : 'completed', taskResult, taskError);
+    }
+    
+    if (!pageData) {
+      console.warn(`[AI] No page data provided for session ${sessionId}, cannot continue`);
+      return;
+    }
+
+    const dataSize = pageData.interactiveElements ? 
+      JSON.stringify(pageData).length : 
+      (pageData.html ? pageData.html.length : 0);
+    console.log(`[AI] Continuing task sequence for session ${sessionId} with page data (${dataSize} chars)`);
+    
+    // Call AI continue endpoint logic
+    const axios = (await import('axios')).default;
+    const response = await axios.post(`http://localhost:${process.env.PORT || 3001}/api/ai/continue`, {
+      sessionId,
+      pageInfo: pageData,
+      lastTaskResult: {
+        task: completedTask,
+        result: taskResult,
+        error: taskError
+      }
+    });
+
+    if (response.data.isComplete) {
+      activeAISessions.delete(sessionId);
+      console.log(`[AI] Session ${sessionId} completed: ${response.data.message || 'Task sequence finished'}`);
+    } else if (response.data.task) {
+      // Update active session with new task
+      activeAISessions.set(sessionId, {
+        extensionId: session.extension_id,
+        taskId: response.data.task.id
+      });
+      console.log(`[AI] Generated next task for session ${sessionId}: ${response.data.task.type}`);
+      console.log(`[AI] Reasoning: ${response.data.reasoning}`);
+    }
+  } catch (error) {
+    console.error(`[AI] Error continuing task sequence for session ${sessionId}:`, error);
+    // Don't delete session on error - allow retry
+  }
+}
+
 // Function to send task to extension
-export function sendTaskToExtension(extensionId, task) {
+function sendTaskToExtension(extensionId, task) {
   const ws = extensionConnections.get(extensionId);
   if (ws && ws.readyState === 1) { // WebSocket.OPEN
-    ws.send(JSON.stringify({
-      type: 'task',
-      task
-    }));
-    return true;
+    try {
+      ws.send(JSON.stringify({
+        type: 'task',
+        task
+      }));
+      return true;
+    } catch (error) {
+      console.error(`[WS] Error sending task to ${extensionId}:`, error);
+      extensionConnections.delete(extensionId);
+      return false;
+    }
+  } else {
+    console.warn(`[WS] Extension ${extensionId} not connected (readyState: ${ws?.readyState})`);
+    return false;
   }
-  return false;
 }
 
 // Routes
 app.use('/api/tasks', taskRoutes);
 app.use('/api/extension', extensionRoutes);
 app.use('/api/auth', authRoutes);
+app.use('/api/ai', aiRoutes);
 
 // Health check
 app.get('/health', (req, res) => {
@@ -130,5 +246,5 @@ server.listen(PORT, () => {
   console.log(`[Server] WebSocket server on ws://localhost:${WS_PORT}/extension/ws`);
 });
 
-export { sendTaskToExtension, extensionConnections };
+export { sendTaskToExtension, extensionConnections, activeAISessions };
 

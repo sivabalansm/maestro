@@ -52,6 +52,7 @@ export async function initDatabase() {
       status TEXT DEFAULT 'pending',
       result TEXT,
       error TEXT,
+      reasoning TEXT,
       scheduled_at DATETIME,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       started_at DATETIME,
@@ -84,6 +85,21 @@ export async function initDatabase() {
     )
   `);
 
+  // AI Sessions table
+  await db.run(`
+    CREATE TABLE IF NOT EXISTS ai_sessions (
+      id TEXT PRIMARY KEY,
+      user_id TEXT,
+      extension_id TEXT,
+      original_prompt TEXT NOT NULL,
+      conversation_history TEXT NOT NULL,
+      status TEXT DEFAULT 'active',
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (user_id) REFERENCES users(id)
+    )
+  `);
+
   console.log('[DB] Database initialized');
 }
 
@@ -91,12 +107,12 @@ export async function createTask(task) {
   const database = getDb();
   const db = promisifyDb(database);
 
-  const { id, userId, extensionId, type, params, scheduledAt } = task;
+  const { id, userId, extensionId, type, params, scheduledAt, reasoning } = task;
 
   await db.run(`
-    INSERT INTO tasks (id, user_id, extension_id, type, params, scheduled_at, status)
-    VALUES (?, ?, ?, ?, ?, ?, 'pending')
-  `, [id, userId, extensionId, type, JSON.stringify(params), scheduledAt || null]);
+    INSERT INTO tasks (id, user_id, extension_id, type, params, scheduled_at, status, reasoning)
+    VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
+  `, [id, userId, extensionId, type, JSON.stringify(params), scheduledAt || null, reasoning || null]);
 
   return task;
 }
@@ -219,5 +235,77 @@ export async function getUserStats(userId) {
     week: weekResult?.count || 0,
     total: totalResult?.count || 0
   };
+}
+
+// AI Session functions
+export async function createAISession(session) {
+  const database = getDb();
+  const db = promisifyDb(database);
+
+  const { id, userId, extensionId, originalPrompt } = session;
+
+  await db.run(`
+    INSERT INTO ai_sessions (id, user_id, extension_id, original_prompt, conversation_history, status)
+    VALUES (?, ?, ?, ?, ?, 'active')
+  `, [id, userId, extensionId, originalPrompt, JSON.stringify([])]);
+
+  return session;
+}
+
+export async function getAISession(sessionId) {
+  const database = getDb();
+  const db = promisifyDb(database);
+
+  const session = await db.get('SELECT * FROM ai_sessions WHERE id = ?', [sessionId]);
+  if (session) {
+    session.conversation_history = JSON.parse(session.conversation_history || '[]');
+  }
+  return session;
+}
+
+export async function updateAISession(sessionId, updates) {
+  const database = getDb();
+  const db = promisifyDb(database);
+
+  const updateFields = [];
+  const values = [];
+
+  if (updates.status !== undefined) {
+    updateFields.push('status = ?');
+    values.push(updates.status);
+  }
+
+  if (updates.conversation_history !== undefined) {
+    updateFields.push('conversation_history = ?');
+    values.push(JSON.stringify(updates.conversation_history));
+  }
+
+  updateFields.push('updated_at = ?');
+  values.push(new Date().toISOString());
+  values.push(sessionId);
+
+  await db.run(
+    `UPDATE ai_sessions SET ${updateFields.join(', ')} WHERE id = ?`,
+    values
+  );
+}
+
+export async function addToConversationHistory(sessionId, entry) {
+  const database = getDb();
+  const db = promisifyDb(database);
+
+  const session = await getAISession(sessionId);
+  if (!session) {
+    throw new Error('Session not found');
+  }
+
+  const history = session.conversation_history || [];
+  history.push({
+    ...entry,
+    timestamp: new Date().toISOString()
+  });
+
+  await updateAISession(sessionId, { conversation_history: history });
+  return history;
 }
 
