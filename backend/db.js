@@ -109,10 +109,13 @@ export async function createTask(task) {
 
   const { id, userId, extensionId, type, params, scheduledAt, reasoning } = task;
 
+  // Use UTC timestamp for created_at to match started_at and completed_at
+  const createdAt = new Date().toISOString();
+
   await db.run(`
-    INSERT INTO tasks (id, user_id, extension_id, type, params, scheduled_at, status, reasoning)
-    VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
-  `, [id, userId, extensionId, type, JSON.stringify(params), scheduledAt || null, reasoning || null]);
+    INSERT INTO tasks (id, user_id, extension_id, type, params, scheduled_at, status, reasoning, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+  `, [id, userId, extensionId, type, JSON.stringify(params), scheduledAt || null, reasoning || null, createdAt]);
 
   return task;
 }
