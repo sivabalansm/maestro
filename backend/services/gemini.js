@@ -245,22 +245,85 @@ export async function generateTask(prompt, pageData, conversationHistory = []) {
       console.warn(`[Gemini] WARNING: Estimated tokens (${estimatedTokens.toLocaleString()}) exceed limit (${MAX_TOKENS.toLocaleString()})`);
     }
 
-    console.log("Full Prompt:", fullPrompt);
-    const result = await model.generateContent(fullPrompt);
-    const response = await result.response;
-    const text = response.text();
+    console.log("Full Prompt:", fullPrompt.substring(0, 500) + (fullPrompt.length > 500 ? '... [truncated in log]' : ''));
+    
+    // Retry logic for valid JSON response
+    const MAX_RETRIES = 5;
+    let attempt = 0;
+    let taskData = null;
+    let lastError = null;
 
-    // Extract JSON from response
-    const jsonMatch = text.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) {
-      throw new Error('No JSON found in Gemini response');
+    while (attempt < MAX_RETRIES && !taskData) {
+      attempt++;
+      
+      try {
+        // Modify prompt on retry to emphasize valid JSON
+        let currentPrompt = fullPrompt;
+        if (attempt > 1) {
+          currentPrompt = `${fullPrompt}\n\nIMPORTANT: You must respond with ONLY valid JSON. No explanations, no markdown, no code blocks. Just the raw JSON object. Previous attempt failed: ${lastError?.message || 'Invalid JSON format'}`;
+          console.log(`[Gemini] Retry attempt ${attempt}/${MAX_RETRIES} - requesting valid JSON`);
+        }
+
+        const result = await model.generateContent(currentPrompt);
+        const response = await result.response;
+        const text = response.text();
+
+        // Extract JSON from response - try multiple strategies
+        let jsonMatch = text.match(/\{[\s\S]*\}/);
+        
+        // If no match, try to find JSON in code blocks
+        if (!jsonMatch) {
+          const codeBlockMatch = text.match(/```(?:json)?\s*(\{[\s\S]*?\})\s*```/);
+          if (codeBlockMatch) {
+            jsonMatch = [codeBlockMatch[1]];
+          }
+        }
+
+        if (!jsonMatch) {
+          throw new Error('No JSON found in Gemini response');
+        }
+
+        // Try to parse the JSON
+        let parsedJson;
+        try {
+          parsedJson = JSON.parse(jsonMatch[0]);
+        } catch (parseError) {
+          throw new Error(`Invalid JSON format: ${parseError.message}`);
+        }
+
+        // Validate task structure
+        if (!parsedJson.type || !parsedJson.params) {
+          throw new Error(`Invalid task structure: missing 'type' or 'params' field. Got: ${JSON.stringify(Object.keys(parsedJson))}`);
+        }
+
+        // Validate task type
+        const validTypes = ['navigate', 'click', 'fill', 'extract', 'wait', 'custom'];
+        if (!validTypes.includes(parsedJson.type)) {
+          throw new Error(`Invalid task type: ${parsedJson.type}. Must be one of: ${validTypes.join(', ')}`);
+        }
+
+        // Success - we have valid JSON
+        taskData = parsedJson;
+        if (attempt > 1) {
+          console.log(`[Gemini] Successfully parsed JSON on attempt ${attempt}`);
+        }
+        
+      } catch (error) {
+        lastError = error;
+        console.warn(`[Gemini] Attempt ${attempt}/${MAX_RETRIES} failed: ${error.message}`);
+        
+        if (attempt >= MAX_RETRIES) {
+          // Final attempt failed
+          throw new Error(`Failed to get valid JSON after ${MAX_RETRIES} attempts. Last error: ${error.message}`);
+        }
+        
+        // Wait a bit before retrying (exponential backoff)
+        await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+      }
     }
 
-    const taskData = JSON.parse(jsonMatch[0]);
-
-    // Validate task structure
-    if (!taskData.type || !taskData.params) {
-      throw new Error('Invalid task structure from Gemini');
+    if (!taskData) {
+      throw new Error(`Failed to get valid JSON after ${MAX_RETRIES} attempts`);
     }
 
     return {
