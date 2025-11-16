@@ -4,6 +4,7 @@ import { generateTask } from '../services/gemini.js';
 import { createAISession, getAISession, updateAISession, addToConversationHistory } from '../db.js';
 import { createTask } from '../db.js';
 import { sendTaskToExtension, extensionConnections } from '../server.js';
+import { extractSchedulingInfo } from '../services/scheduling.js';
 
 const router = express.Router();
 
@@ -19,15 +20,80 @@ router.post('/start', async (req, res) => {
       return res.status(400).json({ error: 'Missing required fields: prompt, extensionId' });
     }
 
+    // Extract scheduling information from prompt
+    const { cleanPrompt, scheduledAt } = extractSchedulingInfo(prompt);
+    const isScheduled = scheduledAt && new Date(scheduledAt) > new Date();
+
     // Create AI session
     const sessionId = uuidv4();
     await createAISession({
       id: sessionId,
       userId: userId || 'anonymous',
       extensionId,
-      originalPrompt: prompt
+      originalPrompt: cleanPrompt, // Store clean prompt without scheduling info
+      scheduledAt: isScheduled ? scheduledAt : null
     });
 
+    // If scheduled, generate first task but don't execute yet
+    if (isScheduled) {
+      // Request page info from extension (we'll need it when task executes)
+      // For now, we can skip this and request it when the task is due
+      // But we need to generate the first task to store it
+      let pageInfo = null;
+      try {
+        pageInfo = await requestPageHtmlFromExtension(extensionId);
+      } catch (error) {
+        console.warn('[AI] Could not get page info for scheduled task, will get it when task executes:', error);
+      }
+
+      // Generate first task using clean prompt (without scheduling info)
+      const taskData = pageInfo 
+        ? await generateTask(cleanPrompt, pageInfo, [])
+        : {
+            type: 'navigate',
+            params: { url: 'about:blank' }, // Placeholder, will be regenerated when executed
+            reasoning: 'Scheduled task - will be executed at scheduled time',
+            isComplete: false
+          };
+
+      // Create task with scheduled time
+      const task = {
+        id: uuidv4(),
+        userId: userId || 'anonymous',
+        extensionId,
+        type: taskData.type,
+        params: taskData.params,
+        reasoning: taskData.reasoning,
+        scheduledAt: scheduledAt
+      };
+
+      await createTask(task);
+
+      // Add to conversation history (include task id for easier lookup)
+      await addToConversationHistory(sessionId, {
+        task: { id: task.id, type: task.type, params: task.params },
+        reasoning: taskData.reasoning,
+        pageInfo: pageInfo ? {
+          url: pageInfo.url,
+          title: pageInfo.title,
+          elementCount: pageInfo.interactiveElements?.length || 0
+        } : null
+      });
+
+      // Don't send to extension - it's scheduled
+      return res.json({
+        success: true,
+        sessionId,
+        task,
+        reasoning: taskData.reasoning,
+        isComplete: false,
+        scheduled: true,
+        scheduledAt: scheduledAt,
+        message: `Task scheduled for ${new Date(scheduledAt).toLocaleString()}`
+      });
+    }
+
+    // Not scheduled - execute immediately
     // Request page info from extension
     const pageInfo = await requestPageHtmlFromExtension(extensionId);
     if (!pageInfo) {
@@ -35,7 +101,7 @@ router.post('/start', async (req, res) => {
     }
 
     // Generate first task using Gemini
-    const taskData = await generateTask(prompt, pageInfo, []);
+    const taskData = await generateTask(cleanPrompt, pageInfo, []);
 
     // Create task
     const task = {
@@ -50,9 +116,9 @@ router.post('/start', async (req, res) => {
 
     await createTask(task);
 
-    // Add to conversation history
+    // Add to conversation history (include task id for easier lookup)
     await addToConversationHistory(sessionId, {
-      task: { type: task.type, params: task.params },
+      task: { id: task.id, type: task.type, params: task.params },
       reasoning: taskData.reasoning,
       pageInfo: {
         url: pageInfo.url,
@@ -79,7 +145,8 @@ router.post('/start', async (req, res) => {
       sessionId,
       task,
       reasoning: taskData.reasoning,
-      isComplete: taskData.isComplete
+      isComplete: taskData.isComplete,
+      scheduled: false
     });
   } catch (error) {
     console.error('[AI] Error starting AI task sequence:', error);
@@ -109,6 +176,7 @@ export async function continueTaskSequence(sessionId, pageData, lastTaskResult) 
   // Add last task result to conversation history with reasoning
   await addToConversationHistory(sessionId, {
     task: lastTaskResult?.task ? {
+      id: lastTaskResult.task.id,
       type: lastTaskResult.task.type,
       params: lastTaskResult.task.params
     } : null,
@@ -156,9 +224,9 @@ export async function continueTaskSequence(sessionId, pageData, lastTaskResult) 
 
   await createTask(task);
 
-  // Add to conversation history
+  // Add to conversation history (include task id for easier lookup)
   await addToConversationHistory(sessionId, {
-    task: { type: task.type, params: task.params },
+    task: { id: task.id, type: task.type, params: task.params },
     reasoning: taskData.reasoning,
     pageInfo: pageInfo.interactiveElements ? {
       url: pageInfo.url,
@@ -233,7 +301,7 @@ router.get('/session/:sessionId', async (req, res) => {
 });
 
 // Helper function to request page info from extension
-function requestPageHtmlFromExtension(extensionId) {
+export function requestPageHtmlFromExtension(extensionId) {
   return new Promise((resolve, reject) => {
     const ws = extensionConnections.get(extensionId);
     if (!ws || ws.readyState !== 1) {

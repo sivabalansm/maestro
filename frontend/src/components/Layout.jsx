@@ -1,5 +1,5 @@
 import { Link, useLocation } from 'react-router-dom';
-import { Home, LayoutDashboard, User, Moon, Sun } from 'lucide-react';
+import { Home, LayoutDashboard, User, Moon, Sun, Clock } from 'lucide-react';
 import { useTheme } from './theme-provider';
 import { cn } from '../lib/utils';
 import ConnectionIndicator from './ConnectionIndicator';
@@ -11,6 +11,7 @@ export default function Layout({ children }) {
   const navItems = [
     { path: '/', icon: Home, label: 'Home' },
     { path: '/dashboard', icon: LayoutDashboard, label: 'Dashboard' },
+    { path: '/scheduled', icon: Clock, label: 'Scheduled' },
     { path: '/account', icon: User, label: 'Account' },
   ];
 

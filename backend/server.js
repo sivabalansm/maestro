@@ -242,6 +242,10 @@ app.get('/health', (req, res) => {
 // Initialize database
 await initDatabase();
 
+// Start task scheduler
+import { startScheduler } from './services/scheduler.js';
+startScheduler();
+
 // Start server
 server.listen(PORT, () => {
   console.log(`[Server] Backend running on http://localhost:${PORT}`);

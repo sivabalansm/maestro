@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from 'react';
-import { Send, Clock } from 'lucide-react';
+import { Send } from 'lucide-react';
 import axios from 'axios';
 import { Button } from '../components/ui/button';
 import { Input } from '../components/ui/input';
@@ -11,7 +11,6 @@ export default function Home() {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
-  const [scheduledTime, setScheduledTime] = useState('');
   const [activeSessions, setActiveSessions] = useState(new Map()); // Track active sessions
   const messagesEndRef = useRef(null);
   const pollIntervalsRef = useRef(new Map()); // Store poll intervals for cleanup
@@ -59,31 +58,47 @@ export default function Home() {
         throw error;
       }
 
-      // Start AI-powered task sequence
+      // Start AI-powered task sequence (scheduling is parsed from prompt)
       const response = await axios.post(`${API_URL}/api/ai/start`, {
         prompt,
         extensionId,
-        userId: 'anonymous',
-        scheduledAt: scheduledTime || null
+        userId: 'anonymous'
       });
 
-      const { task, reasoning, sessionId, isComplete } = response.data;
+      const { task, reasoning, sessionId, isComplete, scheduled, scheduledAt, message } = response.data;
 
-      const assistantMessage = {
-        role: 'assistant',
-        content: `AI Analysis: ${reasoning}\n\nTask: ${task.type}${isComplete ? ' (Complete)' : ' (Continuing...)'}`,
-        task,
-        reasoning,
-        sessionId,
-        isComplete,
-        timestamp: Date.now()
-      };
+      let assistantMessage;
+      if (scheduled) {
+        // Task is scheduled
+        assistantMessage = {
+          role: 'assistant',
+          content: `✅ Task scheduled!\n\n${message || `Scheduled for ${new Date(scheduledAt).toLocaleString()}`}\n\nAI Analysis: ${reasoning}\n\nTask: ${task.type}`,
+          task,
+          reasoning,
+          sessionId,
+          isComplete: false,
+          scheduled: true,
+          scheduledAt,
+          timestamp: Date.now()
+        };
+      } else {
+        // Task executes immediately
+        assistantMessage = {
+          role: 'assistant',
+          content: `AI Analysis: ${reasoning}\n\nTask: ${task.type}${isComplete ? ' (Complete)' : ' (Continuing...)'}`,
+          task,
+          reasoning,
+          sessionId,
+          isComplete,
+          scheduled: false,
+          timestamp: Date.now()
+        };
+      }
 
       setMessages((prev) => [...prev, assistantMessage]);
-      setScheduledTime('');
 
-      // If task is not complete, start polling for updates
-      if (!isComplete && sessionId) {
+      // If task is not complete and not scheduled, start polling for updates
+      if (!isComplete && !scheduled && sessionId) {
         // Track this session and start polling
         setActiveSessions(prev => new Map(prev).set(sessionId, { lastTaskIndex: 0 }));
         const cleanup = pollTaskUpdates(sessionId);
@@ -241,30 +256,18 @@ export default function Home() {
           </div>
 
           {/* Input */}
-          <div className="space-y-2">
-            <div className="flex items-center gap-2">
-              <Input
-                type="datetime-local"
-                value={scheduledTime}
-                onChange={(e) => setScheduledTime(e.target.value)}
-                placeholder="Schedule for later (optional)"
-                className="flex-1"
-              />
-              <Clock className="w-5 h-5 text-muted-foreground" />
-            </div>
-            <div className="flex gap-2">
-              <Input
-                value={input}
-                onChange={(e) => setInput(e.target.value)}
-                onKeyPress={(e) => e.key === 'Enter' && handleSend()}
-                placeholder="Describe a task to automate..."
-                className="flex-1"
-              />
-              <Button onClick={handleSend} disabled={isLoading || !input.trim()}>
-                <Send className="w-4 h-4 mr-2" />
-                Send
-              </Button>
-            </div>
+          <div className="flex gap-2">
+            <Input
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyPress={(e) => e.key === 'Enter' && handleSend()}
+              placeholder="Describe a task to automate... (e.g., 'go to amazon tomorrow at 3pm')"
+              className="flex-1"
+            />
+            <Button onClick={handleSend} disabled={isLoading || !input.trim()}>
+              <Send className="w-4 h-4 mr-2" />
+              Send
+            </Button>
           </div>
         </CardContent>
       </Card>

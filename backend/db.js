@@ -94,6 +94,7 @@ export async function initDatabase() {
       original_prompt TEXT NOT NULL,
       conversation_history TEXT NOT NULL,
       status TEXT DEFAULT 'active',
+      scheduled_at DATETIME,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (user_id) REFERENCES users(id)
@@ -240,17 +241,87 @@ export async function getUserStats(userId) {
   };
 }
 
+// Scheduled tasks functions
+export async function getScheduledTasks(userId) {
+  const database = getDb();
+  const db = promisifyDb(database);
+
+  const now = new Date().toISOString();
+  
+  const tasks = await db.all(
+    `SELECT * FROM tasks 
+     WHERE user_id = ? 
+     AND scheduled_at IS NOT NULL 
+     AND scheduled_at > ?
+     AND status = 'pending'
+     ORDER BY scheduled_at ASC`,
+    [userId, now]
+  );
+
+  return tasks.map(task => ({
+    ...task,
+    params: JSON.parse(task.params),
+    result: task.result ? JSON.parse(task.result) : null
+  }));
+}
+
+export async function updateTaskScheduledTime(taskId, newScheduledAt) {
+  const database = getDb();
+  const db = promisifyDb(database);
+
+  await db.run(
+    'UPDATE tasks SET scheduled_at = ?, updated_at = ? WHERE id = ?',
+    [newScheduledAt, new Date().toISOString(), taskId]
+  );
+
+  return getTask(taskId);
+}
+
+export async function cancelScheduledTask(taskId) {
+  const database = getDb();
+  const db = promisifyDb(database);
+
+  // Delete the task
+  await db.run('DELETE FROM tasks WHERE id = ?', [taskId]);
+  
+  // Also check if there's an associated AI session and mark it as cancelled
+  // We'll need to find the session by looking at tasks, but for now just delete the task
+  return { success: true };
+}
+
+export async function getDueScheduledTasks() {
+  const database = getDb();
+  const db = promisifyDb(database);
+
+  const now = new Date().toISOString();
+  
+  const tasks = await db.all(
+    `SELECT * FROM tasks 
+     WHERE scheduled_at IS NOT NULL 
+     AND scheduled_at <= ?
+     AND status = 'pending'
+     ORDER BY scheduled_at ASC`,
+    [now]
+  );
+
+  return tasks.map(task => ({
+    ...task,
+    params: JSON.parse(task.params),
+    result: task.result ? JSON.parse(task.result) : null
+  }));
+}
+
 // AI Session functions
 export async function createAISession(session) {
   const database = getDb();
   const db = promisifyDb(database);
 
-  const { id, userId, extensionId, originalPrompt } = session;
+  const { id, userId, extensionId, originalPrompt, scheduledAt } = session;
 
   await db.run(`
-    INSERT INTO ai_sessions (id, user_id, extension_id, original_prompt, conversation_history, status)
-    VALUES (?, ?, ?, ?, ?, 'active')
-  `, [id, userId, extensionId, originalPrompt, JSON.stringify([])]);
+    INSERT INTO ai_sessions (id, user_id, extension_id, original_prompt, conversation_history, status, scheduled_at)
+    VALUES (?, ?, ?, ?, ?, 'active', ?)
+  `, [id, userId, extensionId, originalPrompt, JSON.stringify([]), scheduledAt || null]);
 
   return session;
 }
@@ -264,6 +335,65 @@ export async function getAISession(sessionId) {
     session.conversation_history = JSON.parse(session.conversation_history || '[]');
   }
   return session;
+}
+
+export async function getAISessionByTaskId(taskId) {
+  const database = getDb();
+  const db = promisifyDb(database);
+
+  // First, get the task to find its extension_id and user_id
+  const task = await db.get('SELECT * FROM tasks WHERE id = ?', [taskId]);
+  if (!task) {
+    return null;
+  }
+
+  // Find AI session with matching extension_id and user_id that is active
+  const sessions = await db.all(
+    'SELECT * FROM ai_sessions WHERE extension_id = ? AND user_id = ? AND status = ?',
+    [task.extension_id, task.user_id, 'active']
+  );
+  
+  // Check if any session has this task in conversation history (by task id)
+  for (const session of sessions) {
+    const history = JSON.parse(session.conversation_history || '[]');
+    const hasTask = history.some(entry => entry.task && entry.task.id === taskId);
+    
+    if (hasTask) {
+      session.conversation_history = history;
+      return session;
+    }
+  }
+  
+  // If not found in history, check if session has matching scheduled_at
+  for (const session of sessions) {
+    if (session.scheduled_at === task.scheduled_at) {
+      session.conversation_history = JSON.parse(session.conversation_history || '[]');
+      return session;
+    }
+  }
+  
+  return null;
+}
+
+export async function getScheduledAISessions() {
+  const database = getDb();
+  const db = promisifyDb(database);
+
+  const now = new Date().toISOString();
+  
+  const sessions = await db.all(
+    `SELECT * FROM ai_sessions 
+     WHERE scheduled_at IS NOT NULL 
+     AND scheduled_at <= ?
+     AND status = 'active'
+     ORDER BY scheduled_at ASC`,
+    [now]
+  );
+
+  return sessions.map(session => ({
+    ...session,
+    conversation_history: JSON.parse(session.conversation_history || '[]')
+  }));
 }
 
 export async function updateAISession(sessionId, updates) {

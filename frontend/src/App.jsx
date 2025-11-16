@@ -3,6 +3,7 @@ import { ThemeProvider } from './components/theme-provider';
 import Layout from './components/Layout';
 import Home from './pages/Home';
 import Dashboard from './pages/Dashboard';
+import Scheduled from './pages/Scheduled';
 import Account from './pages/Account';
 
 console.log('App.jsx loaded');
@@ -18,6 +19,7 @@ function App() {
             <Routes>
               <Route path="/" element={<Home />} />
               <Route path="/dashboard" element={<Dashboard />} />
+              <Route path="/scheduled" element={<Scheduled />} />
               <Route path="/account" element={<Account />} />
             </Routes>
           </Layout>

@@ -245,7 +245,7 @@ export async function generateTask(prompt, pageData, conversationHistory = []) {
       console.warn(`[Gemini] WARNING: Estimated tokens (${estimatedTokens.toLocaleString()}) exceed limit (${MAX_TOKENS.toLocaleString()})`);
     }
 
-    console.log("Full Prompt:", fullPrompt.substring(0, 500) + (fullPrompt.length > 500 ? '... [truncated in log]' : ''));
+    console.log("Full Prompt:", fullPrompt);
     
     // Retry logic for valid JSON response
     const MAX_RETRIES = 5;

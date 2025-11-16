@@ -21,7 +21,7 @@ router.get('/me', (req, res) => {
     user: {
       id: 'anonymous',
       email: 'user@example.com',
-      name: 'Demo User'
+      name: 'Crazy Demo User hihi'
     }
   });
 });
