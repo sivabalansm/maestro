@@ -204,6 +204,34 @@ router.post('/continue', async (req, res) => {
   }
 });
 
+// Get session status and latest tasks
+router.get('/session/:sessionId', async (req, res) => {
+  try {
+    const { sessionId } = req.params;
+    const session = await getAISession(sessionId);
+    
+    if (!session) {
+      return res.status(404).json({ error: 'Session not found' });
+    }
+
+    // Get the latest task from conversation history
+    const history = session.conversation_history || [];
+    const latestTaskEntry = history.filter(entry => entry.task).pop();
+    
+    res.json({
+      sessionId: session.id,
+      status: session.status,
+      originalPrompt: session.original_prompt,
+      conversationHistory: history,
+      latestTask: latestTaskEntry?.task || null,
+      isComplete: session.status === 'completed'
+    });
+  } catch (error) {
+    console.error('[AI] Error getting session:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Helper function to request page info from extension
 function requestPageHtmlFromExtension(extensionId) {
   return new Promise((resolve, reject) => {

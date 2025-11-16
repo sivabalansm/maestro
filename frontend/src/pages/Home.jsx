@@ -12,7 +12,9 @@ export default function Home() {
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [scheduledTime, setScheduledTime] = useState('');
+  const [activeSessions, setActiveSessions] = useState(new Map()); // Track active sessions
   const messagesEndRef = useRef(null);
+  const pollIntervalsRef = useRef(new Map()); // Store poll intervals for cleanup
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -21,6 +23,14 @@ export default function Home() {
   useEffect(() => {
     scrollToBottom();
   }, [messages]);
+
+  // Cleanup polling intervals on unmount
+  useEffect(() => {
+    return () => {
+      pollIntervalsRef.current.forEach(cleanup => cleanup());
+      pollIntervalsRef.current.clear();
+    };
+  }, []);
 
   const handleSend = async () => {
     if (!input.trim()) return;
@@ -65,7 +75,8 @@ export default function Home() {
         task,
         reasoning,
         sessionId,
-        isComplete
+        isComplete,
+        timestamp: Date.now()
       };
 
       setMessages((prev) => [...prev, assistantMessage]);
@@ -73,8 +84,11 @@ export default function Home() {
 
       // If task is not complete, start polling for updates
       if (!isComplete && sessionId) {
-        // Poll for task updates (in a real implementation, use WebSocket)
-        pollTaskUpdates(sessionId);
+        // Track this session and start polling
+        setActiveSessions(prev => new Map(prev).set(sessionId, { lastTaskIndex: 0 }));
+        const cleanup = pollTaskUpdates(sessionId);
+        // Store cleanup function
+        pollIntervalsRef.current.set(sessionId, cleanup);
       }
     } catch (error) {
       console.error('Error starting AI task:', error);
@@ -88,20 +102,100 @@ export default function Home() {
   };
 
   const pollTaskUpdates = async (sessionId) => {
-    // Simple polling - in production, use WebSocket for real-time updates
+    let pollCount = 0;
+    const maxPolls = 200; // Poll for up to 10 minutes (200 * 3 seconds)
+    
     const pollInterval = setInterval(async () => {
       try {
-        // Check if session is still active
-        // This is a simplified version - in production, you'd get updates via WebSocket
-        // or check task status from the dashboard
+        pollCount++;
+        
+        // Get session status
+        const response = await axios.get(`${API_URL}/api/ai/session/${sessionId}`);
+        const { conversationHistory, isComplete, status } = response.data;
+        
+        // Get the last task index we've seen
+        const sessionInfo = activeSessions.get(sessionId);
+        const lastTaskIndex = sessionInfo?.lastTaskIndex || 0;
+        
+        // Find new tasks in conversation history
+        const taskEntries = conversationHistory
+          .map((entry, idx) => ({ ...entry, index: idx }))
+          .filter(entry => entry.task && entry.index > lastTaskIndex);
+        
+        // Add new task messages to chat
+        if (taskEntries.length > 0) {
+          taskEntries.forEach(entry => {
+            const taskMessage = {
+              role: 'assistant',
+              content: `${entry.reasoning ? `AI: ${entry.reasoning}\n\n` : ''}Task: ${entry.task.type}${entry.task.params?.selector ? ` (${entry.task.params.selector})` : ''}${entry.result ? `\nResult: ${typeof entry.result === 'string' ? entry.result.substring(0, 100) : JSON.stringify(entry.result).substring(0, 100)}` : ''}${entry.error ? `\nError: ${entry.error}` : ''}`,
+              task: entry.task,
+              reasoning: entry.reasoning,
+              sessionId,
+              timestamp: Date.now()
+            };
+            
+            setMessages(prev => [...prev, taskMessage]);
+          });
+          
+          // Update last task index
+          const newLastIndex = Math.max(...taskEntries.map(e => e.index));
+          setActiveSessions(prev => {
+            const newMap = new Map(prev);
+            newMap.set(sessionId, { lastTaskIndex: newLastIndex });
+            return newMap;
+          });
+        }
+        
+        // Stop polling if session is complete
+        if (isComplete || status === 'completed') {
+          // Add completion message
+          setMessages(prev => [...prev, {
+            role: 'assistant',
+            content: '✅ Task sequence completed!',
+            sessionId,
+            timestamp: Date.now()
+          }]);
+          
+          setActiveSessions(prev => {
+            const newMap = new Map(prev);
+            newMap.delete(sessionId);
+            return newMap;
+          });
+          clearInterval(pollInterval);
+          pollIntervalsRef.current.delete(sessionId);
+        }
+        
+        // Stop polling after max attempts
+        if (pollCount >= maxPolls) {
+          clearInterval(pollInterval);
+          setActiveSessions(prev => {
+            const newMap = new Map(prev);
+            newMap.delete(sessionId);
+            return newMap;
+          });
+          pollIntervalsRef.current.delete(sessionId);
+        }
       } catch (error) {
         console.error('Error polling task updates:', error);
-        clearInterval(pollInterval);
+        // Don't stop polling on error - might be temporary
+        if (error.response?.status === 404) {
+          // Session not found, stop polling
+          clearInterval(pollInterval);
+          setActiveSessions(prev => {
+            const newMap = new Map(prev);
+            newMap.delete(sessionId);
+            return newMap;
+          });
+          pollIntervalsRef.current.delete(sessionId);
+        }
       }
-    }, 5000);
+    }, 3000); // Poll every 3 seconds
 
-    // Stop polling after 5 minutes
-    setTimeout(() => clearInterval(pollInterval), 300000);
+    // Return cleanup function
+    return () => {
+      clearInterval(pollInterval);
+      pollIntervalsRef.current.delete(sessionId);
+    };
   };
 
   return (
