@@ -87,7 +87,108 @@ router.post('/start', async (req, res) => {
   }
 });
 
-// Continue task sequence after execution
+// Shared function to continue task sequence (can be called directly or via HTTP)
+export async function continueTaskSequence(sessionId, pageData, lastTaskResult) {
+  // Support both new format (pageInfo) and old format (pageHtml) for backward compatibility
+  const pageInfo = pageData.interactiveElements ? pageData : (pageData.html ? { html: pageData.html } : null);
+
+  if (!sessionId || !pageInfo) {
+    throw new Error('Missing required fields: sessionId, pageInfo');
+  }
+
+  // Get session
+  const session = await getAISession(sessionId);
+  if (!session) {
+    throw new Error('Session not found');
+  }
+
+  if (session.status !== 'active') {
+    throw new Error('Session is not active');
+  }
+
+  // Add last task result to conversation history with reasoning
+  await addToConversationHistory(sessionId, {
+    task: lastTaskResult?.task ? {
+      type: lastTaskResult.task.type,
+      params: lastTaskResult.task.params
+    } : null,
+    reasoning: lastTaskResult?.reasoning || lastTaskResult?.task?.reasoning || null, // Include reasoning
+    result: lastTaskResult?.result,
+    error: lastTaskResult?.error,
+    pageInfo: pageInfo.interactiveElements ? {
+      url: pageInfo.url,
+      title: pageInfo.title,
+      elementCount: pageInfo.interactiveElements?.length || 0
+    } : { html: 'truncated' }
+  });
+
+  // Get updated conversation history (includes the just-completed task)
+  const updatedSession = await getAISession(sessionId);
+  const conversationHistory = updatedSession.conversation_history || [];
+
+  // Generate next task - include all history so AI knows what was done
+  const taskData = await generateTask(
+    session.original_prompt,
+    pageInfo,
+    conversationHistory // Include all history including the just-completed task
+  );
+
+  if (taskData.isComplete) {
+    // Mark session as complete
+    await updateAISession(sessionId, { status: 'completed' });
+    return {
+      success: true,
+      isComplete: true,
+      message: 'Task sequence completed'
+    };
+  }
+
+  // Create next task
+  const task = {
+    id: uuidv4(),
+    userId: session.user_id,
+    extensionId: session.extension_id,
+    type: taskData.type,
+    params: taskData.params,
+    reasoning: taskData.reasoning,
+    scheduledAt: null
+  };
+
+  await createTask(task);
+
+  // Add to conversation history
+  await addToConversationHistory(sessionId, {
+    task: { type: task.type, params: task.params },
+    reasoning: taskData.reasoning,
+    pageInfo: pageInfo.interactiveElements ? {
+      url: pageInfo.url,
+      title: pageInfo.title,
+      elementCount: pageInfo.interactiveElements?.length || 0
+    } : { html: 'truncated' }
+  });
+
+  // Send task to extension
+  const sent = sendTaskToExtension(session.extension_id, task);
+  if (!sent) {
+    throw new Error('Extension not connected');
+  }
+
+  // Update active session tracking
+  const { activeAISessions } = await import('../server.js');
+  activeAISessions.set(sessionId, {
+    extensionId: session.extension_id,
+    taskId: task.id
+  });
+
+  return {
+    success: true,
+    task,
+    reasoning: taskData.reasoning,
+    isComplete: false
+  };
+}
+
+// Continue task sequence after execution (HTTP endpoint)
 router.post('/continue', async (req, res) => {
   try {
     const { sessionId, pageInfo, pageHtml, lastTaskResult } = req.body;
@@ -95,95 +196,8 @@ router.post('/continue', async (req, res) => {
     // Support both new format (pageInfo) and old format (pageHtml) for backward compatibility
     const pageData = pageInfo || (pageHtml ? { html: pageHtml } : null);
 
-    if (!sessionId || !pageData) {
-      return res.status(400).json({ error: 'Missing required fields: sessionId, pageInfo' });
-    }
-
-    // Get session
-    const session = await getAISession(sessionId);
-    if (!session) {
-      return res.status(404).json({ error: 'Session not found' });
-    }
-
-    if (session.status !== 'active') {
-      return res.status(400).json({ error: 'Session is not active' });
-    }
-
-    // Add last task result to conversation history
-    await addToConversationHistory(sessionId, {
-      task: lastTaskResult?.task,
-      result: lastTaskResult?.result,
-      pageInfo: pageData.interactiveElements ? {
-        url: pageData.url,
-        title: pageData.title,
-        elementCount: pageData.interactiveElements?.length || 0
-      } : { html: 'truncated' }
-    });
-
-    // Get updated conversation history
-    const updatedSession = await getAISession(sessionId);
-    const conversationHistory = updatedSession.conversation_history || [];
-
-    // Generate next task
-    const taskData = await generateTask(
-      session.original_prompt,
-      pageData,
-      conversationHistory.slice(0, -1) // Exclude current page state from history
-    );
-
-    if (taskData.isComplete) {
-      // Mark session as complete
-      await updateAISession(sessionId, { status: 'completed' });
-      return res.json({
-        success: true,
-        isComplete: true,
-        message: 'Task sequence completed'
-      });
-    }
-
-    // Create next task
-    const task = {
-      id: uuidv4(),
-      userId: session.user_id,
-      extensionId: session.extension_id,
-      type: taskData.type,
-      params: taskData.params,
-      reasoning: taskData.reasoning,
-      scheduledAt: null
-    };
-
-    await createTask(task);
-
-    // Add to conversation history
-    await addToConversationHistory(sessionId, {
-      task: { type: task.type, params: task.params },
-      reasoning: taskData.reasoning,
-      pageInfo: pageData.interactiveElements ? {
-        url: pageData.url,
-        title: pageData.title,
-        elementCount: pageData.interactiveElements?.length || 0
-      } : { html: 'truncated' }
-    });
-
-    // Send task to extension
-    const sent = sendTaskToExtension(session.extension_id, task);
-    if (!sent) {
-      return res.status(500).json({ error: 'Extension not connected' });
-    }
-
-    // Update active session tracking
-    const { activeAISessions } = await import('../server.js');
-    activeAISessions.set(sessionId, {
-      extensionId: session.extension_id,
-      taskId: task.id
-    });
-
-    res.json({
-      success: true,
-      task,
-      reasoning: taskData.reasoning,
-      isComplete: false
-    });
+    const result = await continueTaskSequence(sessionId, pageData, lastTaskResult);
+    res.json(result);
   } catch (error) {
     console.error('[AI] Error continuing AI task sequence:', error);
     res.status(500).json({ error: error.message });

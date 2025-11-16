@@ -25,7 +25,9 @@ const WS_PORT = PORT;
 
 // Middleware
 app.use(cors());
-app.use(express.json());
+// Increase body parser limit to handle large page data (50MB)
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 // Store active WebSocket connections by extensionId
 const extensionConnections = new Map();
@@ -175,29 +177,26 @@ async function continueAITaskSequence(sessionId, completedTaskId, taskResult, pa
       (pageData.html ? pageData.html.length : 0);
     console.log(`[AI] Continuing task sequence for session ${sessionId} with page data (${dataSize} chars)`);
     
-    // Call AI continue endpoint logic
-    const axios = (await import('axios')).default;
-    const response = await axios.post(`http://localhost:${process.env.PORT || 3001}/api/ai/continue`, {
-      sessionId,
-      pageInfo: pageData,
-      lastTaskResult: {
-        task: completedTask,
-        result: taskResult,
-        error: taskError
-      }
+    // Call continue task sequence function directly (avoid HTTP overhead and body size limits)
+    const { continueTaskSequence } = await import('./routes/ai.js');
+    const result = await continueTaskSequence(sessionId, pageData, {
+      task: completedTask,
+      result: taskResult,
+      error: taskError,
+      reasoning: completedTask?.reasoning || null // Include reasoning from the task
     });
 
-    if (response.data.isComplete) {
+    if (result.isComplete) {
       activeAISessions.delete(sessionId);
-      console.log(`[AI] Session ${sessionId} completed: ${response.data.message || 'Task sequence finished'}`);
-    } else if (response.data.task) {
+      console.log(`[AI] Session ${sessionId} completed: ${result.message || 'Task sequence finished'}`);
+    } else if (result.task) {
       // Update active session with new task
       activeAISessions.set(sessionId, {
         extensionId: session.extension_id,
-        taskId: response.data.task.id
+        taskId: result.task.id
       });
-      console.log(`[AI] Generated next task for session ${sessionId}: ${response.data.task.type}`);
-      console.log(`[AI] Reasoning: ${response.data.reasoning}`);
+      console.log(`[AI] Generated next task for session ${sessionId}: ${result.task.type}`);
+      console.log(`[AI] Reasoning: ${result.reasoning}`);
     }
   } catch (error) {
     console.error(`[AI] Error continuing task sequence for session ${sessionId}:`, error);
