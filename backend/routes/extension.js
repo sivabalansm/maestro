@@ -54,5 +54,16 @@ router.get('/primary', (req, res) => {
   res.json({ extensionId: connections[0], total: connections.length });
 });
 
+// Check connection status
+router.get('/status', (req, res) => {
+  const connections = Array.from(extensionConnections.keys());
+  const isConnected = connections.length > 0;
+  res.json({ 
+    connected: isConnected, 
+    count: connections.length,
+    extensionIds: connections 
+  });
+});
+
 export default router;
 
