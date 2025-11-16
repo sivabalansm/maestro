@@ -5,16 +5,52 @@
 const WS_URL = 'ws://localhost:3001';
 let ws = null;
 let reconnectAttempts = 0;
-const MAX_RECONNECT_ATTEMPTS = 10;
+let reconnectTimeout = null;
 let extensionId = null;
 let pingInterval = null;
 let lastPongTime = null;
+let isConnecting = false;
+let connectionTimeout = null;
 const PING_INTERVAL = 30000; // 30 seconds
 const PONG_TIMEOUT = 60000; // 60 seconds - if no pong received, reconnect
+const CONNECTION_TIMEOUT = 10000; // 10 seconds - timeout for connection attempt
+const INITIAL_RECONNECT_DELAY = 1000; // Start with 1 second
+const MAX_RECONNECT_DELAY = 30000; // Max 30 seconds between attempts
 
 // Initialize WebSocket connection
 async function initWebSocket() {
+  // Prevent multiple simultaneous connection attempts
+  if (isConnecting) {
+    console.log('[Maestro] Connection attempt already in progress, skipping...');
+    return;
+  }
+
+  // Clear any pending reconnect timeout
+  if (reconnectTimeout) {
+    clearTimeout(reconnectTimeout);
+    reconnectTimeout = null;
+  }
+
+  // Close existing connection if any
+  if (ws) {
+    try {
+      // Remove event listeners to prevent triggering reconnect from old connection
+      ws.onopen = null;
+      ws.onclose = null;
+      ws.onerror = null;
+      ws.onmessage = null;
+      if (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN) {
+        ws.close();
+      }
+    } catch (e) {
+      // Ignore errors when closing
+    }
+    ws = null;
+  }
+
   try {
+    isConnecting = true;
+
     // Get or generate extension ID
     const stored = await chrome.storage.local.get(['extensionId']);
     if (stored.extensionId) {
@@ -24,11 +60,28 @@ async function initWebSocket() {
       await chrome.storage.local.set({ extensionId });
     }
 
+    console.log(`[Maestro] Attempting to connect to ${WS_URL}...`);
     ws = new WebSocket(`${WS_URL}/extension/ws?extensionId=${extensionId}`);
 
+    // Connection timeout - if connection doesn't open within CONNECTION_TIMEOUT, consider it failed
+    connectionTimeout = setTimeout(() => {
+      if (ws && ws.readyState === WebSocket.CONNECTING) {
+        console.warn('[Maestro] Connection timeout - server may be down');
+        try {
+          ws.close();
+        } catch (e) {
+          // Ignore errors
+        }
+        isConnecting = false;
+        attemptReconnect();
+      }
+    }, CONNECTION_TIMEOUT);
+
     ws.onopen = () => {
-      console.log('[Maestro] WebSocket connected');
-      reconnectAttempts = 0;
+      clearTimeout(connectionTimeout);
+      console.log('[Maestro] WebSocket connected successfully');
+      isConnecting = false;
+      reconnectAttempts = 0; // Reset on successful connection
       lastPongTime = Date.now();
       
       // Register extension with backend
@@ -52,31 +105,61 @@ async function initWebSocket() {
     };
 
     ws.onerror = (error) => {
+      clearTimeout(connectionTimeout);
       console.error('[Maestro] WebSocket error:', error);
+      isConnecting = false;
+      // Don't reconnect here - let onclose handle it
     };
 
-    ws.onclose = () => {
-      console.log('[Maestro] WebSocket closed, attempting reconnect...');
+    ws.onclose = (event) => {
+      clearTimeout(connectionTimeout);
+      console.log(`[Maestro] WebSocket closed (code: ${event.code}, reason: ${event.reason || 'none'})`);
+      isConnecting = false;
       stopPingInterval();
-      attemptReconnect();
+      
+      // Only reconnect if not a normal closure (code 1000)
+      // Normal closure means intentional disconnect, don't reconnect
+      if (event.code !== 1000) {
+        attemptReconnect();
+      } else {
+        console.log('[Maestro] Normal closure, not reconnecting');
+      }
     };
   } catch (error) {
+    clearTimeout(connectionTimeout);
     console.error('[Maestro] Failed to initialize WebSocket:', error);
+    isConnecting = false;
     attemptReconnect();
   }
 }
 
 function attemptReconnect() {
-  if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
-    reconnectAttempts++;
-    const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000);
-    setTimeout(() => {
-      console.log(`[Maestro] Reconnecting (attempt ${reconnectAttempts})...`);
-      initWebSocket();
-    }, delay);
-  } else {
-    console.error('[Maestro] Max reconnection attempts reached');
+  // Clear any existing reconnect timeout
+  if (reconnectTimeout) {
+    clearTimeout(reconnectTimeout);
+    reconnectTimeout = null;
   }
+
+  // Don't reconnect if already connecting
+  if (isConnecting) {
+    return;
+  }
+
+  reconnectAttempts++;
+  
+  // Exponential backoff: 1s, 2s, 4s, 8s, 16s, 30s (capped), 30s, 30s...
+  const delay = Math.min(
+    INITIAL_RECONNECT_DELAY * Math.pow(2, reconnectAttempts - 1),
+    MAX_RECONNECT_DELAY
+  );
+
+  console.log(`[Maestro] Scheduling reconnect attempt ${reconnectAttempts} in ${delay}ms...`);
+  
+  reconnectTimeout = setTimeout(() => {
+    reconnectTimeout = null;
+    console.log(`[Maestro] Reconnecting (attempt ${reconnectAttempts})...`);
+    initWebSocket();
+  }, delay);
 }
 
 function sendToBackend(data) {
@@ -476,20 +559,62 @@ function stopKeepAlive() {
   }
 }
 
+// Periodic connection health check
+let connectionCheckInterval = null;
+
+function startConnectionCheck() {
+  if (connectionCheckInterval) {
+    clearInterval(connectionCheckInterval);
+  }
+  
+  connectionCheckInterval = setInterval(() => {
+    // Check if connection is alive
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      if (!isConnecting) {
+        console.log('[Maestro] Connection check: WebSocket not connected, attempting reconnect...');
+        attemptReconnect();
+      }
+    }
+  }, 60000); // Check every 60 seconds
+}
+
+function stopConnectionCheck() {
+  if (connectionCheckInterval) {
+    clearInterval(connectionCheckInterval);
+    connectionCheckInterval = null;
+  }
+}
+
 // Initialize on extension install/start
 chrome.runtime.onInstalled.addListener(() => {
   console.log('[Maestro] Extension installed');
   keepServiceWorkerAlive();
-  initWebSocket();
+  startConnectionCheck();
+  // Small delay to ensure storage is ready
+  setTimeout(() => initWebSocket(), 100);
 });
 
 chrome.runtime.onStartup.addListener(() => {
   console.log('[Maestro] Extension started');
   keepServiceWorkerAlive();
-  initWebSocket();
+  startConnectionCheck();
+  setTimeout(() => initWebSocket(), 100);
+});
+
+// Listen for service worker wake-up (Chrome may wake it periodically)
+chrome.runtime.onConnect.addListener((port) => {
+  console.log('[Maestro] Service worker woken up');
+  // Check connection status and reconnect if needed
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    if (!isConnecting) {
+      console.log('[Maestro] Connection lost, reconnecting...');
+      attemptReconnect();
+    }
+  }
 });
 
 // Initialize WebSocket on service worker startup
 keepServiceWorkerAlive();
-initWebSocket();
+startConnectionCheck();
+setTimeout(() => initWebSocket(), 100);
 

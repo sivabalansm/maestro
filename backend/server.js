@@ -139,10 +139,13 @@ async function handleExtensionMessage(extensionId, message) {
         handlePageHtmlResponse(requestId, pageInfo || html);
       }
       break;
+    // Heartbeat response - connection is alive
+    case 'ping':
+      // console.log(`[WS] Ping received from ${extensionId}`);
+      break;
 
     case 'pong':
-      // Heartbeat response - connection is alive
-      // Optionally log for debugging: console.log(`[WS] Pong received from ${extensionId}`);
+      // console.log(`[WS] Pong received from ${extensionId}`);
       break;
 
     default:
