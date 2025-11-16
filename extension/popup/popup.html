@@ -43,13 +43,24 @@
     button:hover {
       background: #0056b3;
     }
+    button#stop-agent:hover {
+      background: #c82333;
+    }
+    button:disabled {
+      background: #6c757d;
+      cursor: not-allowed;
+    }
   </style>
 </head>
 <body>
   <h2 style="margin-top: 0;">Maestro Agent</h2>
   <div id="status" class="status disconnected">Disconnected</div>
   <div id="info" class="info">Connecting to server...</div>
+  <div id="agent-status" class="info" style="margin-top: 12px; display: none;">
+    <strong>Agent Status:</strong> <span id="agent-status-text">Inactive</span>
+  </div>
   <button id="reconnect">Reconnect</button>
+  <button id="stop-agent" style="background: #dc3545; display: none;">Stop Agent</button>
 
   <script src="popup.js"></script>
 </body>

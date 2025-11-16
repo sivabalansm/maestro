@@ -170,7 +170,7 @@ export async function continueTaskSequence(sessionId, pageData, lastTaskResult) 
   }
 
   if (session.status !== 'active') {
-    throw new Error('Session is not active');
+    throw new Error(`Session is not active (status: ${session.status})`);
   }
 
   // Add last task result to conversation history with reasoning
@@ -296,6 +296,68 @@ router.get('/session/:sessionId', async (req, res) => {
     });
   } catch (error) {
     console.error('[AI] Error getting session:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get active AI sessions for an extension
+router.get('/sessions/active', async (req, res) => {
+  try {
+    const { extensionId } = req.query;
+    
+    if (!extensionId) {
+      return res.status(400).json({ error: 'Missing extensionId parameter' });
+    }
+
+    const { getAISessionsByExtension } = await import('../db.js');
+    const sessions = await getAISessionsByExtension(extensionId, 'active');
+    
+    res.json({
+      sessions: sessions.map(s => ({
+        id: s.id,
+        status: s.status,
+        originalPrompt: s.original_prompt,
+        createdAt: s.created_at
+      }))
+    });
+  } catch (error) {
+    console.error('[AI] Error getting active sessions:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Stop all active AI sessions for an extension
+router.post('/stop', async (req, res) => {
+  try {
+    const { extensionId } = req.body;
+    
+    if (!extensionId) {
+      return res.status(400).json({ error: 'Missing extensionId' });
+    }
+
+    const { getAISessionsByExtension, updateAISession } = await import('../db.js');
+    const { activeAISessions } = await import('../server.js');
+    
+    // Get all active sessions for this extension
+    const activeSessions = await getAISessionsByExtension(extensionId, 'active');
+    
+    let cancelledCount = 0;
+    
+    // Cancel each active session
+    for (const session of activeSessions) {
+      await updateAISession(session.id, { status: 'cancelled' });
+      activeAISessions.delete(session.id);
+      cancelledCount++;
+      console.log(`[AI] Cancelled session ${session.id} for extension ${extensionId}`);
+    }
+    
+    res.json({
+      success: true,
+      cancelledSessions: cancelledCount,
+      message: `Cancelled ${cancelledCount} active session(s)`
+    });
+  } catch (error) {
+    console.error('[AI] Error stopping agent:', error);
     res.status(500).json({ error: error.message });
   }
 });

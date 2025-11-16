@@ -396,6 +396,28 @@ export async function getScheduledAISessions() {
   }));
 }
 
+export async function getAISessionsByExtension(extensionId, status = null) {
+  const database = getDb();
+  const db = promisifyDb(database);
+
+  let query = 'SELECT * FROM ai_sessions WHERE extension_id = ?';
+  const params = [extensionId];
+  
+  if (status) {
+    query += ' AND status = ?';
+    params.push(status);
+  }
+  
+  query += ' ORDER BY created_at DESC';
+
+  const sessions = await db.all(query, params);
+
+  return sessions.map(session => ({
+    ...session,
+    conversation_history: JSON.parse(session.conversation_history || '[]')
+  }));
+}
+
 export async function updateAISession(sessionId, updates) {
   const database = getDb();
   const db = promisifyDb(database);

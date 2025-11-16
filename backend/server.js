@@ -118,19 +118,27 @@ async function handleExtensionMessage(extensionId, message) {
     case 'task_result':
       console.log(`[WS] Task ${taskId} result: ${status}`);
       
-      // Check if this task is part of an AI session
-      const sessionEntry = Array.from(activeAISessions.entries()).find(
-        ([_, session]) => session.taskId === taskId
-      );
+        // Check if this task is part of an AI session
+        const sessionEntry = Array.from(activeAISessions.entries()).find(
+          ([_, session]) => session.taskId === taskId
+        );
 
-      // Use pageInfo if available, fallback to pageHtml for backward compatibility
-      const pageData = pageInfo || (pageHtml ? { html: pageHtml } : null);
-      
-      if (sessionEntry && pageData) {
-        const [sessionId, sessionData] = sessionEntry;
-        // Continue AI task sequence
-        await continueAITaskSequence(sessionId, taskId, result, pageData, error);
-      }
+        // Use pageInfo if available, fallback to pageHtml for backward compatibility
+        const pageData = pageInfo || (pageHtml ? { html: pageHtml } : null);
+        
+        if (sessionEntry && pageData) {
+          const [sessionId, sessionData] = sessionEntry;
+          
+          // Check if session is still active (might have been cancelled)
+          const { getAISession } = await import('./db.js');
+          const session = await getAISession(sessionId);
+          if (session && session.status === 'active') {
+            // Continue AI task sequence
+            await continueAITaskSequence(sessionId, taskId, result, pageData, error);
+          } else {
+            console.log(`[WS] Skipping continuation for session ${sessionId} - status is ${session?.status || 'not found'}`);
+          }
+        }
       break;
 
     case 'page_html':
